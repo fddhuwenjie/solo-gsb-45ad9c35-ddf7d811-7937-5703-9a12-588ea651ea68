@@ -1,6 +1,6 @@
 # OpenAPI 契约兼容性审计 API
 
-用 Python + FastAPI 实现的 OpenAPI 3.x 契约服务，提供三个接口：
+用 Python + FastAPI 实现的 OpenAPI 3.x 契约服务，提供四个接口：
 
 - **`POST /audit`**：提交**基线版**与**候选版**两份 OpenAPI 3.x JSON 文档，服务会解析本地 `$ref`（循环安全），并按以下策略判定候选版是否向后兼容：
 
@@ -18,6 +18,13 @@
   组件名 / security 键 / `operationId` / tag 均以 `service_id` 为前缀命名空间化，
   指向 `components` 的本地 `$ref` 同步改写，根级 `security` 物化到未声明该字段的操作上。
 
+- **`POST /examples/validate`**：提交**一份** OpenAPI 3.x 文档，按各媒体类型的 Schema 校验
+  所有 `requestBody` 与响应 **JSON 媒体类型**（`application/json` 及 `*+json`）上的
+  `example` 与 `examples.<name>.value`（含经本地 `$ref` 引用的 Example Object）。
+  请求示例出现 `readOnly` 字段、响应示例出现 `writeOnly` 字段即报错，`required` 按方向生效，
+  区分 3.0 `nullable` 与 3.1 类型联合；纯 Schema 违规返回 `200` + `valid=false`，
+  `externalValue` / 外部或悬空引用返回 `422`。
+
 ## 一条命令启动
 
 需要安装 Docker（含 Compose 插件）。在项目根目录执行：
@@ -34,6 +41,7 @@ docker compose up --build
 | 审计接口 | `POST http://localhost:8080/audit` |
 | 子契约切片接口 | `POST http://localhost:8080/slice` |
 | 网关契约合成接口 | `POST http://localhost:8080/compose` |
+| 示例校验接口 | `POST http://localhost:8080/examples/validate` |
 | 交互式 API 文档（Swagger UI） | http://localhost:8080/docs |
 | OpenAPI 描述文档 | http://localhost:8080/openapi.json |
 
@@ -362,6 +370,111 @@ curl -s -X POST http://localhost:8080/compose \
 > 与 `/audit`、`/slice` 一致：保留内容中任何位置的 `"$ref"` 字符串（包括示例值内部）都按引用处理。
 > 混合 3.0 / 3.1 源时合成契约取最高版本，但 schema 方言差异（如 `nullable`）由调用方自行保证兼容。
 
+## `POST /examples/validate`：校验请求 / 响应示例
+
+给定**一份** OpenAPI 3.x 文档，服务遍历每个操作的 `requestBody` 与各响应，
+对其中 **JSON 媒体类型**（精确匹配 `application/json`，或任意 `*+json` 结构媒体类型；
+`text/plain`、`application/octet-stream` 等不检查）携带的示例逐一按该媒体类型的 `schema` 校验：
+
+- Media Type Object 上的内联 `example`；
+- `examples` 映射中的每个 Example Object，包括经本地 `$ref`
+  （`#/components/examples/...`、`#/components/requestBodies/...`、
+  `#/components/responses/...`、3.1 `components/pathItems/...`）解析到的对象；
+  校验所用的 **Schema `$ref` 同样解析**（含递归 Schema，循环安全）。
+
+### 方向性语义（OpenAPI 规范）
+
+- **请求**示例中出现 Schema 标记为 `readOnly: true` 的属性 → 报错（`keyword: "readOnly"`）；
+  **响应**示例中出现 `writeOnly: true` 的属性 → 报错（`keyword: "writeOnly"`）。
+- `required` **只在对应方向生效**：`readOnly` 属性即使列入 `required`，也只要求响应必带
+  （请求示例缺失不报错）；`writeOnly` 属性相反，只要求请求必带。
+- **类型可空性按版本区分**：OpenAPI 3.0 用 `nullable: true` 放行 `null`；
+  OpenAPI 3.1（JSON Schema 2020-12 方言）用类型联合 `"type": ["string", "null"]`，
+  此时 `nullable` 关键字被忽略。`integer` 是 `number` 的子集；无小数部分的数字也满足 `integer`。
+
+### 支持的 Schema 关键字
+
+`type` / `enum` / `const` / `required` / `properties` / `additionalProperties` /
+`minProperties` / `maxProperties` / `items`（含 3.1 位置元组形态）/ `minItems` / `maxItems` /
+`uniqueItems` / `minLength` / `maxLength` / `pattern` / `minimum` / `maximum` /
+`exclusiveMinimum` / `exclusiveMaximum`（3.0 布尔修饰符与 3.1 数值边界两种写法均支持）/
+`multipleOf` / `allOf` / `anyOf` / `oneOf`，以及布尔 Schema（3.1）。`$ref` 可出现在任意位置。
+
+### 请求
+
+```bash
+curl -s -X POST http://localhost:8080/examples/validate \
+  -H 'Content-Type: application/json' \
+  -d '{"document": { "openapi": "3.0.3", "info": {"title": "Pet API", "version": "1.0"}, "paths": {"...": {}} }}'
+```
+
+### 成功响应（`200`，即使校验失败也是 200）
+
+```json
+{
+  "valid": false,
+  "error_count": 2,
+  "errors": [
+    {
+      "side": "request",
+      "example_pointer": "/paths/~1pets/post/requestBody/content/application~1json/example",
+      "instance_pointer": "/created",
+      "schema_pointer": "/components/schemas/Pet/properties/created",
+      "keyword": "readOnly",
+      "reason": "readOnly property 'created' must not appear in a request example"
+    },
+    {
+      "side": "response",
+      "example_pointer": "/paths/~1pets/post/responses/200/content/application~1json/examples/byId/value",
+      "instance_pointer": "/id",
+      "schema_pointer": "/components/schemas/Pet/properties/id",
+      "keyword": "type",
+      "reason": "expected type integer, got string"
+    }
+  ]
+}
+```
+
+字段说明：
+
+- `side`：示例方向，`request`（来自 `requestBody`）或 `response`（来自响应）。
+- `example_pointer`：示例值在文档中的 JSON Pointer。经 `$ref` 引用的 Example Object
+  会**跟随到组件定义位置**（如 `/components/examples/byId/value`），与 `/audit` 的 Pointer 约定一致；
+  同一组件示例被多处复用时，相同违规只报告一次。
+- `instance_pointer`：违规值在示例 JSON 内部的 JSON Pointer（根示例为 `""`，深层如 `/tags/0/name`）。
+- `schema_pointer`：被违反的 Schema 位置（本地 `$ref` 跟随到组件定义）。
+- `keyword` / `reason`：违反的 Schema 关键字与人类可读原因。
+- `errors` 按 **`(example_pointer, instance_pointer, schema_pointer, keyword, reason)` 升序稳定排序**，
+  与输入键序无关。
+
+### 错误响应
+
+- `400 invalid_openapi_document`：`document` 缺少 `openapi: 3.x` 或 `paths` 对象。
+- `422 unsupported_reference`：示例使用了 `externalValue`（服务不会发起外部网络请求），
+  或示例 / Schema 中出现外部 `$ref`（`http(s)://`、文件路径等）。
+- `422 unresolvable_reference`：校验过程中可达的本地 `$ref` 悬空（包括示例组件间的纯 `$ref` 循环链）。
+- `422 invalid_example`：示例 `$ref` 目标不是 Example Object。
+
+422 响应体的 `references` 逐条给出**来源 JSON Pointer**（引用所在位置）、引用串与原因：
+
+```json
+{
+  "error": "unresolvable_reference",
+  "message": "one or more $ref entries reached while validating examples could not be resolved; fix the references first",
+  "references": [
+    {
+      "pointer": "/paths/~1pets/get/responses/200/content/application~1json/schema",
+      "ref": "#/components/schemas/Missing",
+      "error": "unresolvable reference '#/components/schemas/Missing': object has no property 'Missing'"
+    }
+  ]
+}
+```
+
+> 只有从被检查示例可达的引用才会触发 422；未被任何示例使用的组件里即使有坏引用也不影响结果。
+> 媒体类型未声明 `schema` 时，示例不受任何约束（但 `externalValue` / 坏引用仍按上述规则返回 422）。
+> Example Object 既无 `value` 也无 `externalValue` 时无可校验内容，跳过不报。
+
 ## 检查的变更类别
 
 | category | 说明 | 判定为 breaking 的方向 |
@@ -437,7 +550,13 @@ pytest -q
 path-level `$ref` 链（含多级与中间层同级方法）的冲突检测与来源指针、
 同一合成路径上多条 `$ref` 链的合并（非冲突方法内联后均可从输出路径解析、有效方法按同级覆盖取舍）、
 循环 / 超深引用链 422、
-来源映射完整性、2～20 数量边界、重复 `service_id` 400、被丢弃根字段中的坏引用不阻塞等共 130 个用例。
+来源映射完整性、2～20 数量边界、重复 `service_id` 400、被丢弃根字段中的坏引用不阻塞；
+以及 `/examples/validate` 的内联 `example` 与 `examples.<name>.value`（含本地 `$ref` 示例组件）校验、
+`readOnly` / `writeOnly` 方向报错、`required` 仅对应方向生效、3.0 `nullable` 与 3.1 类型联合、
+integer/number 与布尔值区分、enum/const/allOf/anyOf/oneOf/数值·字符串·数组·对象约束关键字、
+递归 Schema 不爆炸、按示例与实例 Pointer 稳定排序、同一示例组件复用去重、
+`externalValue` / 外部引用 / 悬空引用 / 非对象示例引用 422（含来源 Pointer）、
+不可达坏引用不阻塞、非 JSON 媒体类型跳过、400 文档形态错误等共 178 个用例。
 
 ## 项目结构
 
@@ -445,15 +564,17 @@ path-level `$ref` 链（含多级与中间层同级方法）的冲突检测与�
 .
 ├── app/
 │   ├── __init__.py
-│   ├── main.py          # FastAPI 路由、请求/响应模型、输入校验（/audit、/slice 与 /compose）
+│   ├── main.py          # FastAPI 路由、请求/响应模型、输入校验（/audit、/slice、/compose 与 /examples/validate）
 │   ├── audit.py         # 契约比较引擎（操作/参数/请求体/响应/schema）
 │   ├── slicer.py        # 最小子契约切片（选择器校验、security 继承、$ref 闭包重建、SHA-256）
 │   ├── composer.py      # 网关契约合成（前缀规范化、命名空间化、$ref 改写、冲突检测、来源映射）
+│   ├── examples.py      # 媒体类型示例校验（方向化 readOnly/writeOnly/required、3.0/3.1 可空性、JSON Schema 关键字）
 │   └── refresolver.py   # 本地 $ref 解析（RFC 6901 指针 + 循环检测）
 ├── tests/
 │   ├── test_audit_api.py
 │   ├── test_slice_api.py
-│   └── test_compose_api.py
+│   ├── test_compose_api.py
+│   └── test_examples_api.py
 ├── Dockerfile           # 容器封装全部依赖，非 root 用户运行，含 HEALTHCHECK
 ├── docker-compose.yml   # 一条命令启动，映射 8080 端口
 ├── requirements.txt

@@ -17,6 +17,11 @@ from .composer import (
     OperationConflictError,
     compose_gateway,
 )
+from .examples import (
+    ExampleReferenceError,
+    InvalidExampleDocumentError,
+    validate_document_examples,
+)
 from .slicer import (
     InvalidDocumentError,
     InvalidSelectorError,
@@ -42,7 +47,13 @@ app = FastAPI(
         "operations, component names / security keys / operationIds / tags "
         "are namespaced with the service_id prefix, local components $refs "
         "are rewritten, and a provenance map traces every output path, "
-        "operation and component back to its source."
+        "operation and component back to its source. "
+        "POST /examples/validate checks the 'example' and 'examples.*.value' "
+        "members of requestBody and response JSON media types against their "
+        "media-type schema (local $refs resolved, readOnly/writeOnly and "
+        "required applied direction-dependently, 3.0 'nullable' vs 3.1 type "
+        "unions honored); externalValue or external/dangling references "
+        "return 422, schema violations return 200 with valid=false."
     ),
 )
 
@@ -125,6 +136,47 @@ class ComposeRequest(BaseModel):
     )
 
 
+class ExamplesValidateRequest(BaseModel):
+    document: Dict[str, Any] = Field(
+        ..., description="The OpenAPI 3.x JSON document whose examples are validated."
+    )
+
+
+class ExampleErrorModel(BaseModel):
+    side: Literal["request", "response"] = Field(
+        ..., description="Whether the example belongs to a requestBody or a response."
+    )
+    example_pointer: str = Field(
+        ...,
+        description="JSON Pointer of the example value in the document; "
+        "a $ref'd Example Object is followed to its components location.",
+    )
+    instance_pointer: str = Field(
+        ..., description="JSON Pointer within the example value where the violation occurred."
+    )
+    schema_pointer: str = Field(
+        ...,
+        description="JSON Pointer of the violated schema (local $refs followed "
+        "to the component definition).",
+    )
+    keyword: str = Field(
+        ..., description="The JSON Schema keyword that was violated."
+    )
+    reason: str = Field(..., description="Human-readable explanation")
+
+
+class ExamplesValidateResponse(BaseModel):
+    valid: bool = Field(
+        ..., description="True when every checked example satisfies its schema."
+    )
+    error_count: int
+    errors: List[ExampleErrorModel] = Field(
+        ...,
+        description="Violations sorted stably by example pointer, then "
+        "instance pointer, schema pointer, keyword and reason.",
+    )
+
+
 class ComposeResponse(BaseModel):
     contract: Dict[str, Any] = Field(
         ...,
@@ -201,6 +253,7 @@ def root() -> Dict[str, str]:
         "audit": "POST /audit",
         "slice": "POST /slice",
         "compose": "POST /compose",
+        "examples_validate": "POST /examples/validate",
     }
 
 
@@ -376,3 +429,43 @@ def compose_contract(payload: ComposeRequest) -> JSONResponse:
         status_code=200,
         content={"contract": contract, "provenance": provenance},
     )
+
+
+@app.post(
+    "/examples/validate",
+    response_model=ExamplesValidateResponse,
+    responses={
+        400: {"description": "The submitted document is not OpenAPI 3.x"},
+        422: {
+            "description": "An example uses externalValue, or a reference is "
+            "external, dangling, or does not target an Example Object"
+        },
+    },
+    summary="Validate request/response JSON examples against their schemas",
+)
+def validate_examples(payload: ExamplesValidateRequest) -> JSONResponse:
+    try:
+        errors = validate_document_examples(payload.document)
+    except InvalidExampleDocumentError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "invalid_openapi_document",
+                "messages": exc.messages,
+            },
+        )
+    except ExampleReferenceError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": exc.code,
+                "message": exc.message,
+                "references": exc.references,
+            },
+        )
+    body = ExamplesValidateResponse(
+        valid=not errors,
+        error_count=len(errors),
+        errors=[ExampleErrorModel(**error) for error in errors],
+    )
+    return JSONResponse(status_code=200, content=body.model_dump())
