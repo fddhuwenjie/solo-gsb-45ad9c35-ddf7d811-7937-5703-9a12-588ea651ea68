@@ -1,6 +1,6 @@
 # OpenAPI 契约兼容性审计 API
 
-用 Python + FastAPI 实现的 OpenAPI 3.x 契约服务，提供三个接口：
+用 Python + FastAPI 实现的 OpenAPI 3.x 契约服务，提供四个接口：
 
 - **`POST /audit`**：提交**基线版**与**候选版**两份 OpenAPI 3.x JSON 文档，服务会解析本地 `$ref`（循环安全），并按以下策略判定候选版是否向后兼容：
 
@@ -18,6 +18,14 @@
   组件名 / security 键 / `operationId` / tag 均以 `service_id` 为前缀命名空间化，
   指向 `components` 的本地 `$ref` 同步改写，根级 `security` 物化到未声明该字段的操作上。
 
+- **`POST /examples/validate`**：提交**一份** OpenAPI 3.x 文档，逐个操作校验
+  `requestBody` 与响应的 **JSON 媒体类型**（`application/json` 及 `*+json`）中声明的
+  `example`、`examples.<name>.value`，以及通过本地 `$ref` 指向 `components/examples` 的
+  Example Object 是否符合该媒体类型的 Schema；请求示例中出现 `readOnly` 字段、
+  响应示例中出现 `writeOnly` 字段均报错，`required` 按方向生效，并区分 3.0 `nullable`
+  与 3.1 类型联合。Schema 校验失败仍返回 **200**（`valid: false`），
+  `externalValue`、外部引用与悬空引用返回 **422**。
+
 ## 一条命令启动
 
 需要安装 Docker（含 Compose 插件）。在项目根目录执行：
@@ -34,6 +42,7 @@ docker compose up --build
 | 审计接口 | `POST http://localhost:8080/audit` |
 | 子契约切片接口 | `POST http://localhost:8080/slice` |
 | 网关契约合成接口 | `POST http://localhost:8080/compose` |
+| 示例校验接口 | `POST http://localhost:8080/examples/validate` |
 | 交互式 API 文档（Swagger UI） | http://localhost:8080/docs |
 | OpenAPI 描述文档 | http://localhost:8080/openapi.json |
 
@@ -362,6 +371,118 @@ curl -s -X POST http://localhost:8080/compose \
 > 与 `/audit`、`/slice` 一致：保留内容中任何位置的 `"$ref"` 字符串（包括示例值内部）都按引用处理。
 > 混合 3.0 / 3.1 源时合成契约取最高版本，但 schema 方言差异（如 `nullable`）由调用方自行保证兼容。
 
+## `POST /examples/validate`：校验请求体 / 响应示例
+
+给定一份 OpenAPI 3.x 文档，服务遍历每个操作，找出 **`requestBody`** 与每个**响应**的 JSON 媒体类型
+（`application/json` 及任意 `*+json` 结构化媒体类型，如 `application/vnd.api+json`；
+`text/plain` 等非 JSON 媒体类型不校验）中声明的示例，并按该媒体类型的 **Schema** 把示例当作 JSON 实例校验。
+
+### 示例来源
+
+- 媒体类型对象上的 **`example`**：原始示例值（任意 JSON 值，包括 `null`）。
+- 媒体类型对象上的 **`examples`** 映射：每个具名条目是一个 Example Object，取其 **`value`** 成员作为实例值；
+  只有 `summary` / `description`、没有值的条目跳过不计。
+- `examples` 条目（以及 `requestBody`、响应、path item、Schema 节点）上的**本地 `$ref`** 会被解析：
+  `#/components/examples/...` 的 Example Object 内联后取其 `value`；媒体类型 Schema 的 `$ref`
+  会跟随到组件定义，因此错误中的 Schema Pointer 指向组件内的最终位置。
+- **`externalValue`**（无论内联声明还是位于被引用的 Example Object 中）以及**非本地引用**
+  （`http(s)://`、文件路径等）服务无法获取内容（不会发起任何外部请求），一律返回 **422**；
+  校验过程中触达的**悬空引用**、纯 `$ref` 循环同样返回 **422**。
+
+### 方向规则
+
+示例按其所在位置区分**请求方向**与**响应方向**，`readOnly` / `writeOnly` / `required` 均按方向生效：
+
+- 请求示例中出现 **`readOnly: true`** 属性 → 错误（该字段只能在响应中产出）；
+- 响应示例中出现 **`writeOnly: true`** 属性 → 错误（该字段只能在请求中发送）；
+- **`required`** 仅在对应方向生效：`readOnly` 必填属性不要求请求示例提供，
+  `writeOnly` 必填属性不要求响应示例提供；普通必填属性缺失则在对应方向报错；
+  属性上的方向标记通过 `$ref` 跟随到组件定义后判定。
+
+### 3.0 与 3.1 方言差异
+
+- OpenAPI **3.0** 的 `nullable: true` 等价于允许 `null`；
+- OpenAPI **3.1** 使用 JSON Schema 2020-12 写法，`"type": ["string", "null"]` 联合才允许 `null`，
+  此时 `nullable` 关键字被忽略（不是合法关键字）；
+- 当 `enum` 存在且未列出 `null` 时，`null` 被 `enum` 拒绝（即使声明了 `nullable` / `"null"` 联合）；
+- `integer` 是 `number` 的子类型：`type: number` 接受整数值，`type: integer` 拒绝小数；布尔值不是数字；
+- 数组：3.0 的 `items` 单 Schema 作用于每个元素；3.1 的 `prefixItems`（位置元组）与 `items`
+  （剩余元素约束）分别支持；另支持 `oneOf` / `anyOf`（按是否至少 / 恰好一个分支通过判定）、
+  `allOf`（合并属性与必填约束）、`additionalProperties`、`min/maxProperties`、`min/maxLength`、
+  `pattern`、`min/maxItems`、`uniqueItems`、`minimum/maximum`、3.0 布尔式与 3.1 数值式
+  `exclusiveMinimum/Maximum`、`multipleOf`、3.1 的 `const`。
+
+### 错误排序与响应结构
+
+- **Schema 校验失败不是请求错误**：HTTP 状态码始终为 **200**，由 `valid` 字段表示是否全部通过；
+  每条错误包含 `example_pointer`（示例声明位置）、`instance_pointer`（示例实例内的 JSON Pointer，
+  根值为空串）、`schema_pointer`（违反的 Schema 节点，跟随 `$ref` 到组件定义）、
+  `keyword`（关键字，如 `type` / `required` / `enum` / `readOnly` / `writeOnly`）与 `reason`；
+  错误按 **(example_pointer, instance_pointer, schema_pointer, keyword, reason)** 稳定排序，
+  同一组件示例被多处引用时每个使用位置分别报告。
+- 递归 Schema（如 `Node.child -> Node`）沿引用只展开一次，深层错误照常报告，不会无限递归。
+
+### 请求与成功响应（`200`）
+
+```bash
+curl -s -X POST http://localhost:8080/examples/validate \
+  -H 'Content-Type: application/json' \
+  -d '{"document": { "openapi": "3.0.3", "info": {"title": "Pet API", "version": "1.0"}, "paths": {"...": {}} }}'
+```
+
+```json
+{
+  "valid": false,
+  "examples_checked": 3,
+  "errors": [
+    {
+      "example_pointer": "/paths/~1pets/post/responses/200/content/application~1json/examples/bad",
+      "instance_pointer": "/id",
+      "schema_pointer": "/components/schemas/Pet/properties/id/type",
+      "keyword": "type",
+      "reason": "expected type integer, got string"
+    },
+    {
+      "example_pointer": "/paths/~1pets/post/requestBody/content/application~1json/example",
+      "instance_pointer": "/id",
+      "schema_pointer": "/components/schemas/Pet/properties/id/readOnly",
+      "keyword": "readOnly",
+      "reason": "request example must not include readOnly property 'id'; it is produced only in responses"
+    }
+  ]
+}
+```
+
+### 错误响应
+
+- `400 invalid_openapi_document`：`document` 缺少 `openapi: 3.x` 或 `paths` 对象。
+- `422 unvalidatable_example`：存在无法校验的示例，`issues` 逐条给出问题来源：
+
+```json
+{
+  "error": "unvalidatable_example",
+  "message": "one or more examples cannot be validated because they use externalValue or a reference that is external, dangling, or circular; only inline values and document-local '#/...' targets are supported",
+  "issues": [
+    {
+      "pointer": "/paths/~1pets/post/responses/200/content/application~1json/examples/pet/$ref",
+      "kind": "unresolvable-reference",
+      "ref": "#/components/examples/Gone",
+      "error": "unresolvable reference '#/components/examples/Gone' ..."
+    },
+    {
+      "pointer": "/components/examples/Pet",
+      "kind": "external-value",
+      "ref": "https://example.com/pet.json",
+      "error": "externalValue 'https://example.com/pet.json' cannot be validated: ..."
+    }
+  ]
+}
+```
+
+`kind` 取值：`external-value`（`externalValue`）、`external-reference`（非本地 `$ref`）、
+`unresolvable-reference`（悬空本地指针）、`circular-reference`（`$ref` 死循环）；
+`pointer` 为问题在文档中的来源 JSON Pointer（`externalValue` 声明在被引用组件内时指向组件位置）。
+
 ## 检查的变更类别
 
 | category | 说明 | 判定为 breaking 的方向 |
@@ -437,7 +558,13 @@ pytest -q
 path-level `$ref` 链（含多级与中间层同级方法）的冲突检测与来源指针、
 同一合成路径上多条 `$ref` 链的合并（非冲突方法内联后均可从输出路径解析、有效方法按同级覆盖取舍）、
 循环 / 超深引用链 422、
-来源映射完整性、2～20 数量边界、重复 `service_id` 400、被丢弃根字段中的坏引用不阻塞等共 130 个用例。
+来源映射完整性、2～20 数量边界、重复 `service_id` 400、被丢弃根字段中的坏引用不阻塞；
+以及 `/examples/validate` 的 `example` / `examples.*.value` / 本地 `$ref` Example Object 解析、
+`application/json` 与 `*+json` 媒体类型选取、请求 `readOnly` 与响应 `writeOnly` 报错、
+`required` 按方向豁免、3.0 `nullable` 与 3.1 类型联合（及 `nullable` 在 3.1 被忽略）、
+enum 对 null 的约束、integer/number/boolean 类型判定、类型/数值/字符串/数组/对象/`allOf`/`oneOf`/`anyOf`
+等关键字、递归 Schema、错误按示例与实例 Pointer 稳定排序、`valid=false` 仍返回 200、
+`externalValue` / 外部引用 / 悬空引用 / 循环引用 422（含来源 Pointer）等共 170 个用例。
 
 ## 项目结构
 
@@ -445,15 +572,17 @@ path-level `$ref` 链（含多级与中间层同级方法）的冲突检测与�
 .
 ├── app/
 │   ├── __init__.py
-│   ├── main.py          # FastAPI 路由、请求/响应模型、输入校验（/audit、/slice 与 /compose）
-│   ├── audit.py         # 契约比较引擎（操作/参数/请求体/响应/schema）
-│   ├── slicer.py        # 最小子契约切片（选择器校验、security 继承、$ref 闭包重建、SHA-256）
-│   ├── composer.py      # 网关契约合成（前缀规范化、命名空间化、$ref 改写、冲突检测、来源映射）
-│   └── refresolver.py   # 本地 $ref 解析（RFC 6901 指针 + 循环检测）
+│   ├── main.py               # FastAPI 路由、请求/响应模型、输入校验（/audit、/slice、/compose 与 /examples/validate）
+│   ├── audit.py              # 契约比较引擎（操作/参数/请求体/响应/schema）
+│   ├── slicer.py             # 最小子契约切片（选择器校验、security 继承、$ref 闭包重建、SHA-256）
+│   ├── composer.py           # 网关契约合成（前缀规范化、命名空间化、$ref 改写、冲突检测、来源映射）
+│   ├── example_validator.py  # 请求/响应 JSON 示例校验（方向规则、3.0/3.1 方言、实例 JSON Schema 校验）
+│   └── refresolver.py        # 本地 $ref 解析（RFC 6901 指针 + 循环检测）
 ├── tests/
 │   ├── test_audit_api.py
 │   ├── test_slice_api.py
-│   └── test_compose_api.py
+│   ├── test_compose_api.py
+│   └── test_examples_validate_api.py
 ├── Dockerfile           # 容器封装全部依赖，非 root 用户运行，含 HEALTHCHECK
 ├── docker-compose.yml   # 一条命令启动，映射 8080 端口
 ├── requirements.txt

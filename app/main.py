@@ -17,6 +17,7 @@ from .composer import (
     OperationConflictError,
     compose_gateway,
 )
+from .example_validator import validate_document_examples
 from .slicer import (
     InvalidDocumentError,
     InvalidSelectorError,
@@ -42,7 +43,13 @@ app = FastAPI(
         "operations, component names / security keys / operationIds / tags "
         "are namespaced with the service_id prefix, local components $refs "
         "are rewritten, and a provenance map traces every output path, "
-        "operation and component back to its source."
+        "operation and component back to its source. "
+        "POST /examples/validate checks every requestBody and response JSON "
+        "media-type example (example, examples.*.value and local $ref "
+        "Example Objects) against its schema with direction-aware "
+        "readOnly/writeOnly/required and 3.0 nullable vs 3.1 type-union "
+        "rules; schema failures return 200 with valid=false, while "
+        "externalValue, external and dangling references return 422."
     ),
 )
 
@@ -149,6 +156,62 @@ class ComposeResponse(BaseModel):
     )
 
 
+class ExampleValidateRequest(BaseModel):
+    document: Dict[str, Any] = Field(
+        ..., description="The OpenAPI 3.x JSON document whose examples are checked."
+    )
+
+
+class ExampleErrorModel(BaseModel):
+    example_pointer: str = Field(
+        ...,
+        description=(
+            "JSON Pointer to the example declaration, e.g. the media type's "
+            "'example' or a named 'examples/<name>' entry."
+        ),
+    )
+    instance_pointer: str = Field(
+        ...,
+        description=(
+            "JSON Pointer within the example instance to the offending value "
+            "('' is the example root)."
+        ),
+    )
+    schema_pointer: str = Field(
+        ...,
+        description=(
+            "JSON Pointer to the responsible schema node, following $ref "
+            "chains into component definitions."
+        ),
+    )
+    keyword: str = Field(
+        ...,
+        description=(
+            "The violated schema/OpenAPI keyword, e.g. 'type', 'required', "
+            "'enum', 'readOnly', 'writeOnly'."
+        ),
+    )
+    reason: str = Field(..., description="Human-readable explanation.")
+
+
+class ExampleValidateResponse(BaseModel):
+    valid: bool = Field(
+        ...,
+        description="True only when no example violates its media-type schema.",
+    )
+    examples_checked: int = Field(
+        ..., description="Number of example instances examined."
+    )
+    errors: List[ExampleErrorModel] = Field(
+        ...,
+        description=(
+            "Schema-validation failures, stably sorted by "
+            "(example_pointer, instance_pointer, schema_pointer, keyword, "
+            "reason)."
+        ),
+    )
+
+
 class FindingModel(BaseModel):
     pointer: str = Field(..., description="JSON Pointer into the document")
     category: str = Field(..., description="Machine-readable change category")
@@ -201,6 +264,7 @@ def root() -> Dict[str, str]:
         "audit": "POST /audit",
         "slice": "POST /slice",
         "compose": "POST /compose",
+        "examples": "POST /examples/validate",
     }
 
 
@@ -376,3 +440,52 @@ def compose_contract(payload: ComposeRequest) -> JSONResponse:
         status_code=200,
         content={"contract": contract, "provenance": provenance},
     )
+
+
+@app.post(
+    "/examples/validate",
+    response_model=ExampleValidateResponse,
+    responses={
+        400: {"description": "The submitted document is not OpenAPI 3.x"},
+        422: {
+            "description": (
+                "An example uses externalValue or an external reference, or "
+                "a reachable local reference is dangling/circular"
+            )
+        },
+    },
+    summary="Validate request/response examples against their JSON schemas",
+)
+def validate_examples(payload: ExampleValidateRequest) -> JSONResponse:
+    shape_error = _validate_openapi_shape(payload.document, "document")
+    if shape_error:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "invalid_openapi_document",
+                "messages": [shape_error],
+            },
+        )
+
+    errors, issues, checked = validate_document_examples(payload.document)
+    if issues:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "unvalidatable_example",
+                "message": (
+                    "one or more examples cannot be validated because they "
+                    "use externalValue or a reference that is external, "
+                    "dangling, or circular; only inline values and "
+                    "document-local '#/...' targets are supported"
+                ),
+                "issues": [issue.as_dict() for issue in issues],
+            },
+        )
+
+    body = ExampleValidateResponse(
+        valid=not errors,
+        examples_checked=checked,
+        errors=[ExampleErrorModel(**error.as_dict()) for error in errors],
+    )
+    return JSONResponse(status_code=200, content=body.model_dump())
